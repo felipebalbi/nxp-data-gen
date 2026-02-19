@@ -6,22 +6,43 @@ use std::{fs::File, io::BufReader};
 fn main() -> Result<()> {
     let mut data = Metadata::default();
 
-    let pinout = BufReader::new(File::open("data/mcxa2/pinout.csv")?);
-    let mut pinout_rdr = csv::Reader::from_reader(pinout);
+    // Extract all DMA request lines
+    let dma = BufReader::new(File::open("data/mcxa2/dma.csv")?);
+    let mut dma_rdr = csv::Reader::from_reader(dma);
 
+    let dma_signals = dma_rdr
+        .deserialize::<DmaRecord>()
+        .filter(|r| r.is_ok())
+        .map(|r| r.unwrap())
+        .filter(|r| r.instance.is_some())
+        .map(|r| Signal {
+            name: format!("{}", r.slot),
+            pins: vec![],
+        })
+        .collect::<Vec<_>>();
+
+    // Iterate over the entire memory map extracting each peripheral instance
     let memory_map = BufReader::new(File::open("data/mcxa2/memory-map.csv")?);
     let mut memory_map_rdr = csv::Reader::from_reader(memory_map);
-    let all_peripherals = memory_map_rdr
+    data.peripherals = memory_map_rdr
         .deserialize::<MemoryMapRecord>()
         .filter(|r| r.is_ok())
         .map(|r| r.unwrap().instance.to_uppercase())
         .filter(|name| !name.is_empty())
-        .map(|name| Peripheral::new(name))
+        .map(|name| {
+            let mut per = Peripheral::new(name.clone());
+
+            if &name == "EDMA_0_MP" {
+                per.signals = dma_signals.clone();
+            }
+
+            per
+        })
         .collect::<Vec<_>>();
 
-    data.peripherals = all_peripherals;
-
     // Iterate over the data and extract all valid ALT0 and I/O SUPPLY
+    let pinout = BufReader::new(File::open("data/mcxa2/pinout.csv")?);
+    let mut pinout_rdr = csv::Reader::from_reader(pinout);
     for record in pinout_rdr
         .deserialize::<PinoutRecord>()
         .filter(|r| r.is_ok())
@@ -58,6 +79,38 @@ where
 
     u32::from_str_radix(hex_str, 16)
         .map_err(|e: ParseIntError| serde::de::Error::custom(format!("Invalid hex: {}", e)))
+}
+
+/// Custom function to deserialize a Y/N string into a bool
+fn from_yn<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: &str = Deserialize::deserialize(deserializer)?;
+    let s = s.trim();
+
+    match s {
+        "Y" => Ok(true),
+        _ => Ok(false),
+    }
+}
+
+// Slot_Num,DMA_Request @ Description,Module,Instance ,Instance Type,Name,Async DMA (Y/N)
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
+struct DmaRecord {
+    #[serde(rename = "Slot_Num")]
+    slot: u32,
+    #[serde(rename = "DMA_Request @ Description")]
+    description: String,
+    #[serde(rename = "Instance ")]
+    instance: Option<u32>,
+    #[serde(rename = "Instance Type")]
+    typ: String,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Async DMA (Y/N)", deserialize_with = "from_yn")]
+    is_async: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -210,7 +263,7 @@ impl Default for Metadata {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug)]
 struct Pin {
     name: String,
     supply: String,
@@ -237,7 +290,7 @@ impl Peripheral {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Debug)]
 struct Signal {
     name: String,
     pins: Vec<Pin>,
